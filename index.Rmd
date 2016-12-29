@@ -1,0 +1,178 @@
+---
+title: "Practical Machine Learning Project"
+author: "Jason Culp"
+date: "December 29, 2016"
+output: html_document
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Project Synopsis
+
+Using devices such as *Jawbone Up*, *Nike FuelBand*, and *Fitbit* it is now possible to collect a large amount of data about personal activity relatively inexpensively. These type of devices are part of the quantified self movement - a group of enthusiasts who take measurements about themselves regularly to improve their health, to find patterns in their behavior, or because they are tech geeks. One thing that people regularly do is quantify how much of a particular activity they do, but they rarely quantify how well they do it. In this project, our goal will be to use data from accelerometers on the belt, forearm, arm, and dumbell of 6 participants. They were asked to perform barbell lifts correctly and incorrectly in 5 different ways. More information is available from the website here: <http://groupware.les.inf.puc-rio.br/har>.
+
+The goal of our project is to predict the manner in which participants did the exercise. This is the `classe` outcome variable in the training set. Any of the other variables are available to use in predicting the outcome.
+
+## Model Building
+
+### Data Preparation
+
+We'll be making use of a handful of packages, so we'll load those right away.  We'll also define the seed to be referenced throughout the entire analysis.
+
+```{r message = FALSE, warning = FALSE}
+library(caret)
+library(rpart)
+library(randomForest)
+library(gbm)
+seed <- 123
+```
+
+Let's first load our data and take a high-level look at the structure of the training set.
+
+```{r cache = TRUE}
+training <- read.csv("https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv", header = TRUE)
+testing  <- read.csv("https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv",  header = TRUE)
+dim(training); table(sapply(training, FUN = class), useNA = "ifany")
+```
+
+We see that we have `r dim(training)[2]` variables, which are in the form of either a factor, integer, or numeric.  And below, we can also see that some variables carry blank values.
+
+```{r}
+training[1:3, 17:20]
+```
+
+We can fix this by updating the blanks to be `NA`.
+
+```{r}
+for (i in 1:ncol(training)){
+        training[, i][training[, i] == ""] <- NA
+}
+training[1:3, 17:20]
+```
+
+There are also several variables that exhibit very little variability.  With the help of `nzv()` from the `caret` package, we can eliminate these variables in order to make our model-fitting process more efficient.
+
+```{r cache = TRUE, message = FALSE}
+nearZero <- nzv(training, saveMetrics = FALSE)
+training <- training[, -nearZero]
+dim(training)
+```
+
+Of the remaining `r dim(training)[2]` variables, some are heavily populated with `NA` values.  Let's eliminate those that are `NA` over 95% of the time.
+
+```{r}
+for(i in ncol(training):1) {
+        if(sum(is.na(training[, i])) / nrow(training) > 0.95) {training[, i] <- NULL}
+}
+dim(training)
+```
+
+At this point, the `r dim(training)[2]` variables that remain have some meaningful amount of variability and are not overly dominated by `NA` values.  However, before moving to actual model building, we notice that a few variables are related to the time and user name associated with each observation.  Since those aren't useful in prediction, let's first get rid of these as well.
+
+```{r}
+names(training)[1:6]
+training <- training[, -c(1:6)]
+dim(training)
+```
+
+### Cross-Validation
+
+The `caret` package handles cross-validation (CV) automatically but we want to call this out a bit more directly.  Thus, we'll intentionally create folds that we can use and for which we can observe error behavior throughout our modeling process.  We do so using the `caret` package's `createFolds()` function.
+
+```{r}
+set.seed(seed)
+folds <- createFolds(y = training$classe, k = 10)
+```
+
+We can see that our folds are not only uniform in size, but their `classe` distributions are pretty even as well.
+
+```{r}
+sapply(folds, length)
+sapply(folds, function(x) table(training$classe[x]))
+```
+
+### Decision Tree Model
+
+We start by building a decision tree with `rpart`.  Since we want to observe our CV a bit more directly, we use the `rpart` package, since `caret` handles CV behind the scenes.  The `caret` package also optimizes other tuning parameters and we want to reduce the number of these moving parts in this particular analysis.
+
+Since we'll loop over each of the CV folds, we define `r` objects to hold the results of our model fits, hold-out predictions, and errors.  At this point we can loop over all the folds and store off the information that we want to keep.  Finally we note our error's mean and standard deviation for out rpart models.  For all modeling approaches, we'll use `classe` as the outcome and all of the `r dim(training)[2] - 1` remaining variables as predictors.
+
+```{r cache = TRUE, message = FALSE}
+fitRpart  <- list()
+predRpart <- list()
+errRpart  <- c()
+
+for (i in 1:length(folds)) {
+        fitRpart[[i]]  <- rpart(classe ~ ., method = "class", data = training[-folds[[i]], ])
+        predRpart[[i]] <- predict(fitRpart[[i]], type = "class", newdata = training[folds[[i]], ])
+        errRpart[i]    <- mean(training$classe[folds[[i]]] != predRpart[[i]])
+}
+mean(errRpart); sd(errRpart)
+```
+
+### Random Forest Model
+
+We next follow suit by building a random forest model with `randomForest`.  We similarly define `r` objects to hold our results, loop over our folds, store the information we care about, and state the mean and standard deviation of our errors using this method.
+
+```{r cache = TRUE, message = FALSE}
+fitRF  <- list()
+predRF <- list()
+errRF  <- c()
+
+set.seed(seed)
+for (i in 1:length(folds)) {
+        fitRF[[i]]  <- randomForest(classe ~ ., data = training[-folds[[i]], ])
+        predRF[[i]] <- predict(fitRF[[i]], newdata = training[folds[[i]], ])
+        errRF[i]    <- mean(training$classe[folds[[i]]] != predRF[[i]])
+}
+mean(errRF); sd(errRF)
+```
+
+### Generalized Boosted Regression Model
+
+We finish up by building a generalized boosted regression model with `gbm`, as was done with the previous two approaches.  Note that for the `gbm` approach, an extra step is required that identifies and then transforms the predicted outcomes into a format comparable to the original `classe` values.  Also note that when using default settings in `gbm`, the model didn't perform well.  As a result, the `n.trees` and `interaction.depth` parameters were adjusted.
+
+```{r cache = TRUE, message = FALSE}
+fitGBM    <- list()
+predGBM_M <- list() # To hold raw output in matrix form
+predGBM   <- list() # To hold comparable predicted values, similar to above
+errGBM    <- c()
+
+set.seed(seed)
+for (i in 1:length(folds)) {
+        fitGBM[[i]]    <- gbm(classe ~ ., data = training[-folds[[i]], ], distribution = "multinomial", n.trees = 250, interaction.depth = 4, verbose = FALSE)
+        predGBM_M[[i]] <- predict(fitGBM[[i]], newdata = training[folds[[i]], ], n.trees = fitGBM[[i]]$n.trees, type = "response")
+        predGBM[[i]]   <- apply(predGBM_M[[i]], 1, which.max)
+        predGBM[[i]]   <- colnames(predGBM_M[[i]])[predGBM[[i]]]
+        errGBM[i]      <- mean(training$classe[folds[[i]]] != predGBM[[i]])
+}
+mean(errGBM); sd(errGBM)
+```
+
+## Model Evaluation and Selection
+
+For this project we'll limit our evaluation to the three modeling techniques executed above.  To better compare all three approaches directly, we plot the error rates for each, across all folds.
+
+```{r}
+plot(errRpart, ylim = c(0, 1), col = "red", lwd = 2, type = "l",
+     main = "error rates of all approaches", xlab = "folds", ylab = "error rates")
+lines(errRF, col = "blue", lwd = 2)
+lines(errGBM, col = "darkgreen", lwd = 2)
+legend("topright", c("rpart", "rf", "gbm"), lwd = 2, col = c("red", "blue", "darkgreen"))
+```
+
+As we can see, the `randomForest` model consistently performs the best on unseen data.  For the purpose of predicting the `classe` outcomes of the 20 unlabeled test cases, we fit a single `randomForest` using the entire training dataset.  **This will be our selected model.**
+
+```{r cache = TRUE}
+set.seed(seed)
+fitSelected <- randomForest(classe ~ ., data = training)
+```
+
+The expected out-of-sample error rate, as estimated by our utilization of CV, is very low (`r round(mean(errRF), 3)`).  In fact, the estimated likelihood of correctly classifying all 20 of the test cases is fairly high, at `r round((1 - mean(errRF)) ^ 20, 3)`.
+
+```{r}
+mean(errRF)
+(1 - mean(errRF)) ^ 20
+```
